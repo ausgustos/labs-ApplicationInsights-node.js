@@ -1,0 +1,401 @@
+Crie um arquivo chamado build_poc_msg_zip.sh com o conteúdo abaixo, dê permissão de execução e execute-o. Ele criará a árvore do repositório atualizada e gerará o arquivo poc-msg.zip contendo todo o código, docs, templates e scripts (inclui mudanças do producer para messageId determinístico e Bicep com parâmetro duplicateDetectionWindow).
+
+Comandos rápidos:
+1) Salve o script como build_poc_msg_zip.sh
+2) chmod +x build_poc_msg_zip.sh
+3) ./build_poc_msg_zip.sh
+Resultado: arquivo poc-msg.zip na mesma pasta.
+
+Conteúdo do script (salve exatamente como abaixo):
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="poc-msg"
+ZIP_NAME="poc-msg.zip"
+
+echo "Criando diretório ${ROOT_DIR}..."
+rm -rf "${ROOT_DIR}" "${ZIP_NAME}"
+mkdir -p "${ROOT_DIR}"
+
+# helper to write files
+write_file() {
+  local path="$1"
+  local content="$2"
+  mkdir -p "$(dirname "${ROOT_DIR}/${path}")"
+  cat > "${ROOT_DIR}/${path}" <<'EOF'
+'"$content"'
+EOF
+}
+
+# Because the shell interpolation of variables inside here-documents is complex when building many files,
+# we'll create files using multiple cat <<'EOF' blocks below.
+
+# .gitignore
+cat > "${ROOT_DIR}/.gitignore" <<'EOF'
+node_modules
+.env
+.DS_Store
+poc-msg.zip
+EOF
+
+# README.md (updated)
+cat > "${ROOT_DIR}/README.md" <<'EOF'
+# poc-msg — PoC Service Bus Request-Reply (Node.js)
+
+Este repositório contém uma PoC com dois microserviços Node.js usando Azure Service Bus:
+- producer — envia solicitações de autorização e espera resposta (pattern request-reply usando sessionId = correlationId)
+- autorizador — consome solicitações, aplica lógica (simulada) e responde no reply queue
+
+Principais características desta versão:
+- Producer usa messageId determinístico (preferência por idempotencyKey -> transactionId -> hash do payload canônico).
+- Bicep inclui parâmetro duplicateDetectionWindow para habilitar duplicate detection no Service Bus.
+- Request-reply via sessions (reply queue com requiresSession = true).
+- Exemplo de idempotência sem store (usando duplicate detection): reduz necessidade de armazenar chave de idempotência separada (veja limitações).
+- Scripts: create-repo.sh (usa gh CLI) e build_poc_msg_zip.sh (este script) para criar zip.
+
+Pré-requisitos
+- Docker & docker-compose (para execução local)
+- Azure CLI (az) para provisionamento opcional e Bicep
+- GitHub CLI (gh) autenticado (se quiser usar create-repo.sh)
+- SERVICE_BUS_CONNECTION_STRING (Connection string com permissões Send/Listen)
+
+Como usar (local)
+1. Provisionar (opcional)
+   az group create --name poc-msg-rg --location eastus
+   az deployment group create --resource-group poc-msg-rg --template-file bicep/main.bicep \
+     --parameters namespaceName=poc-sb-namespace requestQueueName=authorization-requests replyQueueName=authorization-replies duplicateDetectionWindow='PT1H'
+
+2. Preparar .env
+   cp producer/.env.example producer/.env
+   cp autorizador/.env.example autorizador/.env
+   Edite ambos para incluir SERVICE_BUS_CONNECTION_STRING
+
+3. Rodar local com docker-compose
+   docker-compose up --build
+
+4. Teste via HTTP
+   curl -s -X POST http://localhost:3000/authorize \
+     -H "Content-Type: application/json" \
+     -d '{"transactionId":"tx-123","amount":500,"cardNumber":"4111111111111111"}'
+
+Observações sobre idempotência (sem store)
+- Duplicate detection evita que o broker aceite mensagens com o mesmo messageId dentro da janela configurada (duplicateDetectionWindow).
+- Atenção: se a primeira mensagem for enviada e o autorizador NÃO responder (por crash), o reenvio com o mesmo messageId será descartado pelo broker → o produtor ficará sem resposta.
+- Para produção financeira/critica combine duplicate detection com persistência no DB (unique constraint / upsert) e outbox pattern.
+
+Estrutura do repositório gerado:
+- .gitignore
+- README.md
+- create-repo.sh
+- docker-compose.yml
+- bicep/main.bicep
+- .github/workflows/ci-cd.yml
+- producer/ (source, Dockerfile, .env.example)
+- autorizador/ (source, Dockerfile, .env.example)
+
+EOF
+
+# create-repo.sh
+cat > "${ROOT_DIR}/create-repo.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_OWNER="ausgustos"
+REPO_NAME="poc-msg"
+REMOTE="origin"
+
+if ! command -v gh &> /dev/null; then
+  echo "gh CLI não encontrado. Instale e autentique: https://cli.github.com/"
+  exit 1
+fi
+
+echo "Criando repositório ${REPO_OWNER}/${REPO_NAME} (privado) via gh..."
+gh repo create "${REPO_OWNER}/${REPO_NAME}" --private --confirm --source=. --remote="${REMOTE}" --push
+
+echo "Feito. Configure secrets (SERVICE_BUS_CONNECTION_STRING) no repositório via Settings → Secrets."
+EOF
+chmod +x "${ROOT_DIR}/create-repo.sh"
+
+# docker-compose.yml
+cat > "${ROOT_DIR}/docker-compose.yml" <<'EOF'
+version: "3.8"
+services:
+  autorizador:
+    build: ./autorizador
+    env_file:
+      - ./autorizador/.env
+    restart: unless-stopped
+  producer:
+    build: ./producer
+    env_file:
+      - ./producer/.env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - autorizador
+EOF
+
+# bicep/main.bicep (updated with duplicateDetectionWindow param)
+mkdir -p "${ROOT_DIR}/bicep"
+cat > "${ROOT_DIR}/bicep/main.bicep" <<'EOF'
+param location string = resourceGroup().location
+param namespaceName string = 'poc-sb-namespace'
+param requestQueueName string = 'authorization-requests'
+param replyQueueName string = 'authorization-replies'
+param duplicateDetectionWindow string = 'PT1H' // PT1H, PT24H, PT7D etc.
+
+resource sbNamespace 'Microsoft.ServiceBus/namespaces@2021-11-01' = {
+  name: namespaceName
+  location: location
+  sku: {
+    name: 'Standard'
+    tier: 'Standard'
+  }
+  properties: {}
+}
+
+resource requestQueue 'Microsoft.ServiceBus/namespaces/queues@2021-11-01' = {
+  parent: sbNamespace
+  name: requestQueueName
+  properties: {
+    lockDuration: 'PT30S'
+    enablePartitioning: false
+    deadLetteringOnMessageExpiration: true
+    duplicateDetectionHistoryTimeWindow: duplicateDetectionWindow
+  }
+}
+
+resource replyQueue 'Microsoft.ServiceBus/namespaces/queues@2021-11-01' = {
+  parent: sbNamespace
+  name: replyQueueName
+  properties: {
+    lockDuration: 'PT30S'
+    requiresSession: true
+    deadLetteringOnMessageExpiration: true
+    duplicateDetectionHistoryTimeWindow: duplicateDetectionWindow
+  }
+}
+EOF
+
+# .github workflow
+mkdir -p "${ROOT_DIR}/.github/workflows"
+cat > "${ROOT_DIR}/.github/workflows/ci-cd.yml" <<'EOF'
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install dependencies (producer)
+        run: |
+          cd producer
+          npm ci
+      - name: Install dependencies (autorizador)
+        run: |
+          cd autorizador
+          npm ci
+      - name: Run lints/tests (placeholder)
+        run: echo "Add tests and linters as needed"
+EOF
+
+# Producer
+mkdir -p "${ROOT_DIR}/producer"
+cat > "${ROOT_DIR}/producer/package.json" <<'EOF'
+{
+  "name": "poc-producer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@azure/service-bus": "^7.14.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "uuid": "^9.0.0"
+  }
+}
+EOF
+
+cat > "${ROOT_DIR}/producer/.env.example" <<'EOF'
+SERVICE_BUS_CONNECTION_STRING=Endpoint=sb://...
+REQUEST_QUEUE=authorization-requests
+REPLY_QUEUE=authorization-replies
+PORT=3000
+REQUEST_TIMEOUT_MS=30000
+EOF
+
+cat > "${ROOT_DIR}/producer/Dockerfile" <<'EOF'
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci --production
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]
+EOF
+
+# producer/index.js updated (deterministic messageId)
+cat > "${ROOT_DIR}/producer/index.js" <<'EOF'
+// producer/index.js
+require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const { ServiceBusClient } = require('@azure/service-bus');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(express.json());
+
+const connectionString = process.env.SERVICE_BUS_CONNECTION_STRING;
+const requestQueue = process.env.REQUEST_QUEUE || 'authorization-requests';
+const replyQueue = process.env.REPLY_QUEUE || 'authorization-replies';
+const port = process.env.PORT || 3000;
+const requestTimeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '30000', 10);
+
+if (!connectionString) {
+  console.error('SERVICE_BUS_CONNECTION_STRING is required in env');
+  process.exit(1);
+}
+
+const sbClient = new ServiceBusClient(connectionString);
+const sender = sbClient.createSender(requestQueue);
+
+// Deterministic messageId: prefer idempotencyKey, then transactionId, else hash of canonical payload
+function deterministicMessageId(transaction) {
+  if (transaction.idempotencyKey) return transaction.idempotencyKey;
+  if (transaction.transactionId) return `tx-${transaction.transactionId}`;
+  // canonicalize relevant fields to avoid ordering differences
+  const canonical = {
+    amount: transaction.amount || null,
+    cardNumber: transaction.cardNumber ? transaction.cardNumber.slice(-8) : null,
+    merchantId: transaction.merchantId || null
+  };
+  const json = JSON.stringify(canonical);
+  return crypto.createHash('sha256').update(json).digest('hex');
+}
+
+// Send request and wait for reply using sessions (sessionId = correlationId)
+async function sendRequestAndWait(transaction) {
+  const correlationId = uuidv4();
+  const messageId = deterministicMessageId(transaction);
+
+  const message = {
+    messageId,
+    body: transaction,
+    contentType: 'application/json',
+    correlationId,
+    replyTo: replyQueue,
+    sessionId: correlationId,
+    applicationProperties: {
+      idempotencyKey: transaction.idempotencyKey || null
+    }
+  };
+
+  await sender.sendMessages(message);
+  console.log(`Sent request messageId=${messageId} correlationId=${correlationId}`);
+
+  // Accept session on reply queue and wait for response
+  // Note: reply queue must have requiresSession = true
+  const receiver = await sbClient.acceptSession(replyQueue, correlationId, { maxAutoRenewLockDurationInMs: 30000 });
+
+  try {
+    const received = await receiver.receiveMessages(1, { maxWaitTimeInMs: requestTimeout });
+    if (!received || received.length === 0) {
+      throw new Error('Timeout waiting for reply');
+    }
+    const msg = received[0];
+    await receiver.completeMessage(msg);
+    return {
+      correlationId: msg.correlationId,
+      body: msg.body,
+      properties: msg.applicationProperties
+    };
+  } finally {
+    await receiver.close();
+  }
+}
+
+app.post('/authorize', async (req, res) => {
+  const transaction = req.body;
+  if (!transaction || !transaction.amount || !transaction.cardNumber) {
+    return res.status(400).json({ error: 'transaction needs amount and cardNumber' });
+  }
+  try {
+    const reply = await sendRequestAndWait(transaction);
+    return res.json({ correlationId: reply.correlationId, result: reply.body });
+  } catch (err) {
+    console.error('Error sending request:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Producer listening on port ${port}`);
+});
+
+process.on('SIGINT', async () => {
+  console.log('Closing Service Bus client...');
+  await sender.close();
+  await sbClient.close();
+  process.exit(0);
+});
+EOF
+
+# Autorizador
+mkdir -p "${ROOT_DIR}/autorizador"
+cat > "${ROOT_DIR}/autorizador/package.json" <<'EOF'
+{
+  "name": "poc-autorizador",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@azure/service-bus": "^7.14.0",
+    "dotenv": "^16.0.0"
+  }
+}
+EOF
+
+cat > "${ROOT_DIR}/autorizador/.env.example" <<'EOF'
+SERVICE_BUS_CONNECTION_STRING=Endpoint=sb://...
+REQUEST_QUEUE=authorization-requests
+REPLY_QUEUE=authorization-replies
+PROCESSING_DELAY_MS=250
+EOF
+
+cat > "${ROOT_DIR}/autorizador/Dockerfile" <<'EOF'
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci --production
+COPY . .
+CMD ["npm", "start"]
+EOF
+
+# autorizador/index.js (unchanged from earlier PoC)
+cat > "${ROOT_DIR}/autorizador/index.js" <<'EOF'
+// autorizador/index.js
+require('dotenv').config();
+const { ServiceBusClient } = require('@azure/service-bus');
+
+const connectionString = process.env.SERVICE_BUS_CONNECTION_STRING;
+const requestQueue = process.env.REQUEST_QUEUE || 'authorization-requests';
+const replyQueue = process.env.REPLY_QUEUE || 'authorization-replies';
+const processingDelay = parseInt(process.env.PROCESSING_DELAY_MS || '250
